@@ -1,0 +1,34 @@
+# المكتبات اللي الكود بيستخدمها فعلاً (Vercel + الباك اب اليومي على GitHub Actions)
+# أي مكتبة جديدة تتضاف هنا بس لو الكود بيعملها import
+
+# Web framework
+Flask==3.1.2
+Werkzeug==3.1.3
+Jinja2==3.1.6
+itsdangerous==2.2.0
+MarkupSafe==3.0.3
+blinker==1.9.0
+click==8.3.0
+Flask-Login==0.6.3
+
+# Database
+Flask-SQLAlchemy==3.1.1
+SQLAlchemy==2.0.44
+psycopg2-binary>=2.9.9
+
+# Config & time
+python-dotenv==1.2.1
+pytz
+
+# HTTP (Telegram + image sync)
+requests==2.32.5
+
+# Images (compression + Cloudinary upload)
+pillow==12.0.0
+cloudinary==1.46.0
+
+# Google Drive backup upload
+google-api-python-client==2.187.0
+google-auth==2.41.1
+google-auth-httplib2==0.2.0
+httplib2==0.31.0

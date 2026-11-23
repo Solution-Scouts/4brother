@@ -1,0 +1,17 @@
+{# رسائل النظام (نجاح / تحذير / خطأ) - بتظهر فوق الصفحة وتتقفل بالضغط على × #}
+{% with messages = get_flashed_messages(with_categories=true) %}
+{% if messages %}
+<div id="sysFlash" dir="rtl"
+     style="position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:20000;width:min(560px,calc(100% - 24px));display:flex;flex-direction:column;gap:8px;">
+    {% for category, message in messages %}
+    {% set c = {'success':('#e7f6ec','#1e7b45'),'warning':('#fff6e0','#8a5a00'),'info':('#e7f1fb','#1f5f8b')}.get(category, ('#fdecec','#b42318')) %}
+    <div role="alert"
+         style="background:{{ c[0] }};color:{{ c[1] }};border:1px solid {{ c[1] }};border-radius:10px;padding:12px 44px 12px 14px;position:relative;font-weight:600;line-height:1.6;box-shadow:0 4px 14px rgba(0,0,0,.12);">
+        {{ message }}
+        <button type="button" aria-label="إغلاق" onclick="this.parentElement.remove()"
+                style="position:absolute;top:8px;left:10px;background:none;border:0;font-size:20px;line-height:1;color:inherit;cursor:pointer;">&times;</button>
+    </div>
+    {% endfor %}
+</div>
+{% endif %}
+{% endwith %}

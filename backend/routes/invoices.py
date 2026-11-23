@@ -1,0 +1,1323 @@
+"""
+Routes: invoices
+Auto-extracted from backend/app.py during refactoring.
+"""
+import os
+import json
+import math
+import re
+import random
+import string
+from datetime import datetime, date, timedelta
+from functools import wraps
+from flask import render_template, request, redirect, url_for, flash, jsonify, session, abort
+from flask_login import login_required, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+from sqlalchemy import func, text, or_
+
+from ..core import app, db, cairo_now, basedir, FACTORY_LAT, FACTORY_LNG, ALLOWED_RADIUS, allowed_file, BASE_DIR
+from ..models import (
+    SystemSetting, AttendanceSettings, User, Attendance, PatternTracking,
+    Category, ProductModel, EmployeeExcuse, ProductVariant, Supplier,
+    PartnerTransaction, SupplierPayment, PurchaseOrder, PurchaseItem,
+    Customer, CustomerPayment, ShippingCompany, SaleOrder, SaleItem,
+    FinancialTransaction, ReturnInvoice, MoneyAccount, StockMovement,
+    HRTransaction, ExpenseCategory, Expense
+)
+from ..helpers import (general_manager_required, permission_required, permission_required_any,
+                       get_accessible_users, get_allowed_customers,
+                       calculate_user_commission, calculate_distance,
+                       stock_add, stock_deduct)
+
+def update_monthly_commissions(sales_rep_id, ref_date):
+    """
+    دالة تعيد حساب عمولات الشهر بالكامل للموظف ومديره
+    كل شهر مستقل بذاته - بدون تراكم أو تسويات بأثر رجعي
+    """
+    try:
+        # 1. تحديد الموظف والشريك (المدير)
+        sales_rep = User.query.get(sales_rep_id)
+        if not sales_rep: return
+
+        partners = []
+        if getattr(sales_rep, 'partner_group_id', None):
+            partners = User.query.filter_by(role='manager', partner_group_id=sales_rep.partner_group_id).all()
+        else:
+            if sales_rep.role == 'manager':
+                partners = [sales_rep]
+            elif sales_rep.manager_id:
+                mgr = User.query.get(sales_rep.manager_id)
+                if mgr and mgr.role == 'manager':
+                    partners = [mgr]
+
+        if not partners: return
+        num_partners = len(partners)
+
+        # 2. تحديد حدود الشهر
+        target_month_str = ref_date.strftime('%Y-%m')
+        target_month_start = ref_date.replace(day=1, hour=0, minute=0, second=0)
+        next_month = (target_month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+        # 3. حساب إجمالي مبيعات الشهر فقط (لتحديد الشريحة)
+        monthly_sales = db.session.query(func.sum(SaleItem.quantity))\
+            .join(SaleOrder)\
+            .filter(SaleOrder.user_id == sales_rep.id,
+                    SaleOrder.is_proforma == False,
+                    SaleOrder.date >= target_month_start,
+                    SaleOrder.date < next_month)\
+            .scalar() or 0
+
+        # خصم المرتجعات في نفس الشهر (حسب تاريخ المرتجع، حتى لو البيع من شهر قديم)
+        monthly_returns = db.session.query(func.sum(ReturnInvoice.total_qty))\
+            .join(SaleOrder)\
+            .filter(SaleOrder.user_id == sales_rep.id,
+                    ReturnInvoice.date >= target_month_start,
+                    ReturnInvoice.date < next_month)\
+            .scalar() or 0
+
+        total_monthly_items = max(0, monthly_sales - monthly_returns)
+
+        # 4. تحديد سعر عمولة الموظفة (بناءً على صافي مبيعات الشهر)
+        rate_per_item = 0.0
+        if sales_rep.job_type == 'tiered_sales' and sales_rep.commission_rules:
+            try:
+                tiers = json.loads(sales_rep.commission_rules)
+                for tier in tiers:
+                    t_min = float(tier.get('min', 0))
+                    t_max = float(tier.get('max', 999999))
+                    t_val = float(tier.get('val', 0))
+                    if t_min <= total_monthly_items <= t_max:
+                        rate_per_item = t_val
+                        break
+            except: pass
+        elif sales_rep.commission_value:
+            rate_per_item = float(sales_rep.commission_value)
+
+        # LOGGING (safe for read-only filesystems like Vercel)
+        try:
+            with open('debug_comm_log.txt', 'a', encoding='utf-8') as f:
+                f.write(f"\n--- DEBUG [{target_month_str}]: {sales_rep.fullname} (ID:{sales_rep.id}) ---\n")
+                f.write(f"Partner: {partner.fullname} (ID:{partner.id})\n")
+                f.write(f"job_type: {sales_rep.job_type}, commission_value: {sales_rep.commission_value}, commission_rules: {sales_rep.commission_rules}\n")
+                f.write(f"Monthly Sales: {monthly_sales}, Monthly Returns: {monthly_returns}, Net: {total_monthly_items}\n")
+                f.write(f"Rate: {rate_per_item}\n")
+        except:
+            pass  # Vercel read-only filesystem
+
+        # 5. حذف التسويات القديمة
+        for p in partners:
+            PartnerTransaction.query.filter(
+                PartnerTransaction.partner_id == p.id,
+                PartnerTransaction.type == 'sub_commission',
+                PartnerTransaction.order_id == None,
+                PartnerTransaction.description.like(f"%{sales_rep.fullname}%"),
+                PartnerTransaction.date >= target_month_start,
+                PartnerTransaction.date < next_month
+            ).delete(synchronize_session=False)
+
+        # 6. تحديث فواتير الشهر
+        monthly_orders = SaleOrder.query.filter(
+            SaleOrder.user_id == sales_rep.id,
+            SaleOrder.is_proforma == False,
+            SaleOrder.date >= target_month_start,
+            SaleOrder.date < next_month
+        ).all()
+
+        total_month_comm = 0.0
+
+        for order in monthly_orders:
+            # أ) تنظيف القديم — فقط حركات نفس الشهر (حتى لا تحذف مرتجعات الأشهر السابقة)
+            PartnerTransaction.query.filter(
+                PartnerTransaction.order_id == order.id,
+                PartnerTransaction.type.in_(['commission_gross', 'sub_commission']),
+                PartnerTransaction.date >= target_month_start,
+                PartnerTransaction.date < next_month
+            ).delete(synchronize_session=False)
+
+            # ب) حساب صافي الفاتورة — query مباشر لتجنب cache العلاقات (مرتجعات نفس الشهر فقط)
+            gross_qty = sum(item.quantity for item in order.items)
+            returned_qty = db.session.query(func.sum(ReturnInvoice.total_qty)).filter(
+                ReturnInvoice.order_id == order.id,
+                ReturnInvoice.date >= target_month_start,
+                ReturnInvoice.date < next_month
+            ).scalar() or 0
+            net_qty = max(0, gross_qty - returned_qty)
+            
+            if net_qty <= 0: continue
+
+            # ج) عمولة الشريك (Gross) - من البروفايل
+            partner_rate = float(partners[0].commission_value or 15.0)
+            gross_amt = (net_qty * partner_rate) / num_partners
+            for p in partners:
+                db.session.add(PartnerTransaction(
+                    partner_id=p.id,
+                    order_id=order.id,
+                    type='commission_gross',
+                    amount=gross_amt,
+                    description=f"عمولة ({net_qty} قطعة × {partner_rate}) مشتركة ({num_partners}) - فاتورة مبيعات ({sales_rep.fullname})",
+                    date=order.date
+                ))
+
+            # د) عمولة الموظفة (تتخصم من الشريك)
+            if (not any(p.id == sales_rep.id for p in partners)) and rate_per_item > 0:
+                girl_comm = net_qty * rate_per_item
+                total_month_comm += girl_comm
+                sub_amt = girl_comm / num_partners
+                
+                for p in partners:
+                    db.session.add(PartnerTransaction(
+                        partner_id=p.id,
+                        order_id=order.id,
+                        type='sub_commission',
+                        amount=-sub_amt,
+                        description=f"عمولة ({sales_rep.fullname}) مشتركة ({num_partners}) - شهر {target_month_str} ({total_monthly_items} قطعة، فئة {rate_per_item})",
+                        date=order.date
+                    ))
+
+        try:
+            with open('debug_comm_log.txt', 'a', encoding='utf-8') as f:
+                f.write(f"Total Month Commission: {total_month_comm}\n")
+        except:
+            pass  # Vercel read-only filesystem
+
+        db.session.commit()
+        print(f"Updated monthly commissions for Partner {partners[0].fullname} from Sales {sales_rep.fullname}")
+
+    except Exception as e:
+        print(f"Error updating commissions: {e}")
+        # Note: Do not rollback here because it cancels the entire transaction.
+
+
+
+@app.route('/invoice/print/<int:id>')
+@login_required
+def print_invoice(id):
+    order = SaleOrder.query.get_or_404(id)
+    
+    return_map = {}
+    total_returned_qty = 0
+    returned_items_amount = 0
+
+    if order.return_invoices or order.shipping_status in ['returned', 'partial_return']:
+        movements = StockMovement.query.filter(StockMovement.reason.like(f"%مرتجع فاتورة #{order.id}%")).all()
+        items_by_variant = {i.variant_id: i for i in order.items}
+        
+        for mv in movements:
+            if mv.variant_id:
+                qty_chg = mv.quantity_change
+                return_map[mv.variant_id] = return_map.get(mv.variant_id, 0) + qty_chg
+                total_returned_qty += qty_chg
+                
+                sale_item = items_by_variant.get(mv.variant_id)
+                if sale_item:
+                    returned_items_amount += qty_chg * sale_item.unit_price
+
+    after_total_amount = order.total_amount - returned_items_amount
+    after_final_total = after_total_amount - order.discount
+    
+    return_stats = {
+        'total_returned_qty': total_returned_qty,
+        'returned_items_amount': returned_items_amount,
+        'after_total_amount': after_total_amount,
+        'after_final_total': after_final_total
+    }
+                    
+    return render_template('invoice.html', order=order, return_map=return_map, return_stats=return_stats)
+# === الكتالوج الرقمي (رابط عام للعملاء) ===
+
+@app.route('/invoice/convert/<int:id>')
+@login_required
+def convert_to_invoice(id):
+    order = SaleOrder.query.get_or_404(id)
+
+    # التأكد أنها عرض سعر فعلاً
+    if not order.is_proforma:
+        return redirect(url_for('print_invoice', id=id))
+
+    # 0. التحقق من توفر المخزون قبل الخصم لمنع نزول الرصيد بالسالب
+    insufficient_items = []
+    for item in order.items:
+        if item.variant and item.variant.stock < item.quantity:
+            insufficient_items.append(f"{item.variant.model.name} (المتاح: {item.variant.stock}، المطلوب: {item.quantity})")
+
+    if insufficient_items:
+        flash(f"عفواً، لا يمكن اعتماد الفاتورة لعدم توفر كمية كافية بالمخزن: {', '.join(insufficient_items)}", "danger")
+        return redirect(request.referrer or url_for('invoices'))
+
+    # 1. خصم الكميات من المخزن (لأنها أصبحت فاتورة فعلية)
+    for item in order.items:
+        if item.variant:
+            if not stock_deduct(item.variant.id, item.quantity):
+                db.session.rollback()
+                flash(f"عفواً، لا يمكن اعتماد الفاتورة: الكمية المتاحة من {item.variant.model.name} اتغيرت ومبقتش كفاية (المتاح الآن: {item.variant.stock})", "danger")
+                return redirect(request.referrer or url_for('invoices'))
+            db.session.add(StockMovement(
+                variant_id=item.variant.id,
+                user_id=current_user.id,
+                quantity_change=-item.quantity,
+                reason=f"تحويل عرض سعر #{order.id} لفاتورة"
+            ))
+
+    # 2. تحديث حالة الفاتورة
+    order.is_proforma = False
+    order.date = cairo_now() # تحديث التاريخ لوقت الاعتماد
+
+    # === [التعديل هنا] ضبط حالة الشحن ===
+    if order.is_shipping:
+        # لو الفاتورة شحن، نخلي حالتها 'none' عشان تظهر في صفحة الشحن كشحنة جديدة
+        order.shipping_status = 'none'
+    else:
+        # لو استلام محل، نعتبرها 'settled' (منتهية لوجيستياً)
+        order.shipping_status = 'settled'
+
+    # 3. تسجيل عمولات الشركاء (لأنها أصبحت بيعة حقيقية)
+    if order.user_id:
+        seller_user = db.session.get(User, order.user_id)
+        partner = None
+        if seller_user.role == 'manager':
+            partner = seller_user
+        elif seller_user.manager_id:
+            mgr = db.session.get(User, seller_user.manager_id)
+            if mgr and mgr.role == 'manager':
+                partner = mgr
+
+        # خصم التخفيض من الشريك (لو الفاتورة فيها خصم)
+        if partner and order.discount and order.discount > 0:
+            db.session.add(PartnerTransaction(
+                partner_id=partner.id,
+                order_id=order.id,
+                type='discount_deduction',
+                amount=-order.discount,
+                description=f"خصم ممنوح للعميل - فاتورة #{order.id}",
+                date=order.date
+            ))
+
+        # تحديث عمولات السيلز والشريك (commission_gross + sub_commission)
+        update_monthly_commissions(order.user_id, order.date)
+
+    db.session.commit()
+    flash('تم اعتماد عرض السعر وتحويله لفاتورة بنجاح، وتم إدراجها في الشحن ✅', 'success')
+    return redirect(url_for('print_invoice', id=id))
+
+
+@app.route('/invoice/revert_to_draft/<int:order_id>', methods=['POST'])
+@login_required
+def revert_to_draft(order_id):
+    """تحويل فاتورة تامة إلى مسودة (عرض سعر) مع عكس كل التأثيرات المالية والمخزنية"""
+    if current_user.role != 'general_manager' and current_user.username != 'gm_ahmed':
+        return jsonify({'success': False, 'message': 'هذه العملية متاحة فقط للمدير العام'}), 403
+
+    try:
+        order = SaleOrder.query.get(order_id)
+        if not order:
+            return jsonify({'success': False, 'message': 'الفاتورة غير موجودة'}), 404
+
+        if order.is_proforma:
+            return jsonify({'success': False, 'message': 'هذه الفاتورة مسودة بالفعل'}), 400
+
+        # التحقق من عدم وجود مرتجعات
+        if order.return_invoices and len(order.return_invoices) > 0:
+            return jsonify({'success': False, 'message': 'لا يمكن تحويل فاتورة عليها مرتجعات إلى مسودة. احذف المرتجعات أولاً.'}), 400
+
+        # === 1. إرجاع المخزون ===
+        for item in order.items:
+            if item.variant:
+                stock_add(item.variant.id, item.quantity)
+                db.session.add(StockMovement(
+                    variant_id=item.variant.id,
+                    user_id=current_user.id,
+                    quantity_change=item.quantity,
+                    reason=f"تحويل فاتورة #{order_id} إلى مسودة"
+                ))
+
+        # === 2. عكس المعاملات المالية (إرجاع الفلوس من الخزنة) ===
+        financial_txs = FinancialTransaction.query.filter(
+            FinancialTransaction.description.like(f'%#{order_id}%'),
+            FinancialTransaction.description.like('%فاتورة%')
+        ).all()
+
+        for tx in financial_txs:
+            if tx.description and re.search(rf'فاتورة.*#{order_id}\b', tx.description):
+                if tx.account_id:
+                    if tx.type == 'income':
+                        db.session.execute(text("UPDATE money_account SET balance = round(CAST(balance - :amt AS numeric), 1) WHERE id = :id"), {'amt': tx.amount, 'id': tx.account_id})
+                    elif tx.type == 'expense':
+                        db.session.execute(text("UPDATE money_account SET balance = round(CAST(balance + :amt AS numeric), 1) WHERE id = :id"), {'amt': tx.amount, 'id': tx.account_id})
+                db.session.delete(tx)
+
+        # === 3. حذف حركات الشركاء المرتبطة بالفاتورة ===
+        PartnerTransaction.query.filter_by(order_id=order_id).delete(synchronize_session=False)
+
+        # === 4. حذف سجلات HR المرتبطة بالفاتورة ===
+        hr_txs = HRTransaction.query.filter(
+            HRTransaction.note.like(f'%#{order_id}%'),
+            HRTransaction.note.like('%فاتورة%')
+        ).all()
+        for htx in hr_txs:
+            if htx.note and re.search(rf'فاتورة.*#{order_id}\b', htx.note):
+                db.session.delete(htx)
+
+        # === 5. تحويل الفاتورة لمسودة ===
+        order.is_proforma = True
+        order.shipping_status = None
+
+        db.session.commit()
+
+        # === 6. تحديث العمولات ===
+        if order.user_id:
+            update_monthly_commissions(order.user_id, order.date)
+
+        return jsonify({'success': True, 'message': 'تم تحويل الفاتورة إلى مسودة بنجاح! يمكنك تعديلها الآن من قسم عروض الأسعار ✏️'})
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'message': f'خطأ: {str(e)}'}), 500
+
+@app.route('/invoice/edit_proforma/<int:id>')
+@login_required
+def edit_proforma(id):
+    order = SaleOrder.query.get_or_404(id)
+
+    # التأكد أنها مسودة (عرض سعر)
+    if not order.is_proforma:
+        flash('لا يمكن تعديل فاتورة تم اعتمادها، فقط عروض الأسعار.', 'warning')
+        return redirect(url_for('invoices'))
+
+    # تجهيز البيانات لإرسالها للجافاسكريبت 
+    order_data = {
+        'id': order.id,
+        'user_id': order.user_id,
+        'customer_id': order.customer_id,
+        'discount': order.discount,
+        'paid_upfront': order.paid_upfront,
+        'is_shipping': order.is_shipping,
+        'shipping_company_id': order.shipping_company_id,
+        'is_office_invoice': False,
+        'packer_id': order.packer_id,
+        'items': []
+    }
+
+    for item in order.items:
+        order_data['items'].append({
+            'id': item.variant.id,
+            'name': item.variant.model.name,
+            'price': item.unit_price,
+            'qty': item.quantity,
+            'stock': item.variant.stock, # عشان الـ Validation
+            'cost_price': (item.variant.cost_price or 0) if current_user.fullname == "أحمد عبد الفتاح" else 0,
+            'barcode': item.variant.barcode or ''
+        })
+
+    # إرسال نفس البيانات التي تحتاجها صفحة POS العادية + بيانات الفاتورة
+    accessible_ids = get_accessible_users()
+    customers = Customer.query.filter(
+        or_(Customer.created_by_id.in_(accessible_ids), Customer.name == "عميل نقدي")
+    ).order_by(Customer.id.desc()).all()
+
+    allowed_sellers = User.query.filter(User.id.in_(accessible_ids)).all()
+
+    return render_template('pos.html',
+                           categories=Category.query.all(),
+                           products=ProductVariant.query.join(ProductModel).order_by(ProductVariant.id).all(),
+                           customers=customers,
+                           shipping_companies=ShippingCompany.query.all(),
+                           money_accounts=MoneyAccount.get_ordered(),
+                           all_employees=User.query.all(),
+                           allowed_sellers=allowed_sellers,
+                           # المتغير الجديد المهم جداً 👇
+                           edit_order_data=order_data)
+
+@app.route('/invoice/delete/<int:order_id>', methods=['POST'])
+@login_required
+def delete_invoice(order_id):
+    if not current_user.has_perm('manage_orders') and current_user.role != 'general_manager':
+        return jsonify({'success': False, 'message': 'غير مصرح لك بحذف الفواتير'}), 403
+
+    try:
+        order = SaleOrder.query.get(order_id)
+        if not order:
+            return jsonify({'success': False, 'message': 'الفاتورة غير موجودة'}), 404
+
+        # =========================================================
+        # === 1. إرجاع الأموال للخزينة وتصحيح الرصيد (الجديد) ===
+        # =========================================================
+        # نبحث عن كل المعاملات المالية المرتبطة بهذه الفاتورة
+        financial_txs = FinancialTransaction.query.filter(
+            FinancialTransaction.description.like(f'%#{order_id}%'),
+            FinancialTransaction.description.like('%فاتورة%')
+        ).all()
+
+        valid_financial_txs = []
+        for tx in financial_txs:
+            if tx.description and re.search(rf'فاتورة.*#{order_id}\b', tx.description):
+                valid_financial_txs.append(tx)
+
+        for tx in valid_financial_txs:
+            if tx.account_id:
+                if tx.type == 'income':
+                    db.session.execute(text("UPDATE money_account SET balance = round(CAST(balance - :amt AS numeric), 1) WHERE id = :id"), {'amt': tx.amount, 'id': tx.account_id})
+                elif tx.type == 'expense':
+                    db.session.execute(text("UPDATE money_account SET balance = round(CAST(balance + :amt AS numeric), 1) WHERE id = :id"), {'amt': tx.amount, 'id': tx.account_id})
+                elif tx.type == 'refund':
+                    # رد نقدي لمرتجع: متسجل بالسالب، فبنرجّع المبلغ للخزنة
+                    db.session.execute(text("UPDATE money_account SET balance = round(CAST(balance + :amt AS numeric), 1) WHERE id = :id"), {'amt': abs(tx.amount or 0), 'id': tx.account_id})
+            db.session.delete(tx)
+
+        # 2. إرجاع المخزون (الكمية الصافية بعد خصم اللي رجع قبل كده بمرتجع)
+        if not order.is_proforma:
+            already_returned = {}
+            if order.return_invoices:
+                ret_moves = StockMovement.query.filter(
+                    StockMovement.reason.like(f"%مرتجع فاتورة #{order_id}%")
+                ).all()
+                for mv in ret_moves:
+                    if mv.variant_id and re.search(rf'مرتجع فاتورة #{order_id}\b', mv.reason or ''):
+                        already_returned[mv.variant_id] = already_returned.get(mv.variant_id, 0) + (mv.quantity_change or 0)
+
+            for item in order.items:
+                if not item.variant_id:
+                    continue
+                prev_ret = already_returned.get(item.variant_id, 0)
+                restore_qty = max(0, item.quantity - prev_ret)
+                # لو نفس الصنف متكرر في الفاتورة، المرتجع بيتخصم مرة واحدة بس
+                already_returned[item.variant_id] = max(0, prev_ret - item.quantity)
+                if restore_qty <= 0:
+                    continue
+                db.session.execute(text("UPDATE product_variant SET stock = stock + :qty WHERE id = :vid"),
+                                   {'qty': restore_qty, 'vid': item.variant_id})
+                db.session.add(StockMovement(
+                    variant_id=item.variant_id,
+                    user_id=current_user.id,
+                    quantity_change=restore_qty,
+                    reason=f"حذف فاتورة #{order_id}"
+                ))
+
+        # 3. تنظيف الحسابات الأخرى
+        hr_txs = HRTransaction.query.filter(
+            HRTransaction.note.like(f'%#{order_id}%'),
+            HRTransaction.note.like('%فاتورة%')
+        ).all()
+        for htx in hr_txs:
+            if htx.note and re.search(rf'فاتورة.*#{order_id}\b', htx.note):
+                db.session.delete(htx)
+                
+        PartnerTransaction.query.filter_by(order_id=order_id).delete(synchronize_session=False)
+        db.session.execute(text("DELETE FROM return_invoice WHERE order_id = :oid"), {'oid': order_id})
+
+        # نحفظ البائع والتاريخ قبل الحذف، لأن الفاتورة مش هتبقى موجودة بعد الـ commit
+        seller_id = order.user_id
+        order_date = order.date
+
+        # 4. حذف الأصناف والفاتورة
+        db.session.execute(text("DELETE FROM sale_item WHERE order_id = :oid"), {'oid': order_id})
+        db.session.execute(text("DELETE FROM sale_order WHERE id = :oid"), {'oid': order_id})
+
+        db.session.commit()
+
+        # تحديث العمولات
+        if seller_id and order_date:
+            update_monthly_commissions(seller_id, order_date)
+
+        return jsonify({'success': True, 'message': 'تم حذف الفاتورة، تصفير المديونية، وإرجاع الفلوس للخزنة بنجاح! 💰🗑️'})
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'message': f'خطأ قاعدة بيانات: {str(e)}'}), 500
+
+@app.route('/invoice/edit/<int:id>', methods=['GET', 'POST'])
+@general_manager_required
+def edit_invoice(id):
+    order = SaleOrder.query.get_or_404(id)
+    if order.date.date() != cairo_now().date(): flash('لا يمكن تعديل فواتير سابقة', 'warning'); return redirect(url_for('invoices'))
+    if request.method == 'POST':
+        # === 1. قراءة السطور الجديدة من الفورم (بالـ ID بتاع المنتج مش بالاسم، علشان فيه أسماء متكررة) ===
+        variant_ids = request.form.getlist('variant_id[]')
+        qtys = request.form.getlist('qty[]')
+        p_names = request.form.getlist('product_name[]')
+
+        new_lines = []   # [(variant, qty)]
+        unknown = []
+        for i in range(len(qtys)):
+            try: qty = int(qtys[i])
+            except: qty = 0
+            if qty <= 0:
+                continue
+            vid = (variant_ids[i] if i < len(variant_ids) else '').strip()
+            variant = ProductVariant.query.get(int(vid)) if vid.isdigit() else None
+            if not variant:
+                unknown.append(p_names[i] if i < len(p_names) and p_names[i] else f"سطر {i + 1}")
+                continue
+            new_lines.append((variant, qty))
+
+        if unknown:
+            flash(f"لم يتم حفظ التعديل: اختار المنتج من القائمة لـ: {', '.join(unknown)}", "danger")
+            return redirect(request.url)
+        if not new_lines:
+            flash("لم يتم حفظ التعديل: الفاتورة لازم يبقى فيها صنف واحد على الأقل. لو عايز تلغيها استخدم الحذف.", "warning")
+            return redirect(request.url)
+
+        # === 2. الأسعار المتفق عليها: الصنف اللي كان في الفاتورة بيحتفظ بسعره، والجديد بياخد سعر البيع ===
+        old_items = list(order.items)
+        old_qty, old_price = {}, {}
+        for it in old_items:
+            if it.variant_id:
+                old_qty[it.variant_id] = old_qty.get(it.variant_id, 0) + (it.quantity or 0)
+                old_price.setdefault(it.variant_id, it.unit_price)
+        new_qty = {}
+        for variant, qty in new_lines:
+            new_qty[variant.id] = new_qty.get(variant.id, 0) + qty
+
+        # === 3. المخزون: بنعدل الفرق بس لكل صنف، ومع تسجيل الحركة (عروض الأسعار مبتأثرش على المخزون) ===
+        if not order.is_proforma:
+            for vid in set(old_qty) | set(new_qty):
+                diff = new_qty.get(vid, 0) - old_qty.get(vid, 0)
+                if diff == 0:
+                    continue
+                if diff > 0:
+                    if not stock_deduct(vid, diff):
+                        db.session.rollback()
+                        v = ProductVariant.query.get(vid)
+                        name = v.model.name if v and v.model else f"#{vid}"
+                        flash(f"لا يمكن تعديل الفاتورة! رصيد المخزن غير كافٍ لـ: {name} (المتاح: {v.stock if v else 0}، المطلوب زيادة: {diff})", "danger")
+                        return redirect(request.url)
+                else:
+                    stock_add(vid, -diff)
+                db.session.add(StockMovement(
+                    variant_id=vid,
+                    user_id=current_user.id,
+                    quantity_change=-diff,
+                    reason=f"تعديل فاتورة #{order.id}"
+                ))
+
+        # === 4. استبدال سطور الفاتورة ===
+        for it in old_items:
+            db.session.delete(it)
+        total = 0
+        for variant, qty in new_lines:
+            price = old_price.get(variant.id)
+            if price is None:
+                price = variant.sell_price or 0
+            total += price * qty
+            db.session.add(SaleItem(order=order, variant_id=variant.id, quantity=qty, unit_price=price, total_price=price * qty))
+        order.discount = float(request.form.get('discount', 0))
+        order.total_amount = total
+        order.final_total = total - order.discount
+        # التصحيح: إزالة shipping_fee من المعادلة عشان متتحسبش مرتين
+        order.amount_due = order.final_total - order.paid_upfront
+
+        # === [إصلاح] تحديث عمولات الشركاء بعد التعديل ===
+        if not order.is_proforma:
+            seller_user = db.session.get(User, order.user_id)
+            partner = None
+            if seller_user.role == 'manager':
+                partner = seller_user
+            elif seller_user.manager_id:
+                mgr = db.session.get(User, seller_user.manager_id)
+                if mgr and mgr.role == 'manager':
+                    partner = mgr
+
+            if partner:
+                # حذف الخصم القديم وإنشاء الجديد
+                PartnerTransaction.query.filter_by(
+                    order_id=order.id, type='discount_deduction'
+                ).delete(synchronize_session=False)
+
+                if order.discount > 0:
+                    db.session.add(PartnerTransaction(
+                        partner_id=partner.id,
+                        order_id=order.id,
+                        type='discount_deduction',
+                        amount=-order.discount,
+                        description=f"خصم ممنوح للعميل - فاتورة #{order.id}",
+                        date=order.date
+                    ))
+
+            # تحديث commission_gross و sub_commission
+            update_monthly_commissions(order.user_id, order.date)
+
+        db.session.commit(); return redirect(url_for('invoices'))
+    products = []
+    for m in ProductModel.query.order_by(ProductModel.name).all():
+        for v in m.variants:
+            label = f"{m.name} - {m.category.name if m.category else ''} | {v.barcode or v.id}"
+            products.append({'id': v.id, 'label': label, 'price': v.sell_price or 0, 'stock': v.stock or 0})
+    return render_template('edit_invoice.html', order=order, products=products)
+
+
+_RETURN_REASON_RE = re.compile(r'مرتجع فاتورة #([0-9]+)')
+
+
+def _prefetch_invoice_list_data(orders):
+    """بتجهز لصفحة سجل الفواتير كل اللي كانت بتسأل عنه فاتورة فاتورة:
+    - كل الموظفين (مرة واحدة، والباقي بيتجاب من الذاكرة).
+    - حركات المخزون الخاصة بالمرتجعات لكل الفواتير في استعلام واحد.
+      المطابقة هنا نفس سلوك البحث القديم بالظبط: LIKE '%مرتجع فاتورة #{id}%'
+      يعني الحركة اللي سببها "#4920" بتتحسب كمان للفواتير #4 و #49 و #492.
+    """
+    if not orders:
+        return []
+    from sqlalchemy.orm import selectinload
+    users = User.query.all()
+
+    needs = any(o.returns or o.return_invoices or o.shipping_status in ['returned', 'partial_return'] for o in orders)
+    by_key = {}
+    if needs:
+        movements = StockMovement.query.options(selectinload(StockMovement.variant).selectinload(ProductVariant.model))\
+            .filter(StockMovement.reason.like('%مرتجع فاتورة #%'))\
+            .order_by(StockMovement.id).all()
+        for mv in movements:
+            keys = set()
+            for m in _RETURN_REASON_RE.finditer(mv.reason or ''):
+                digits = m.group(1)
+                for k in range(1, len(digits) + 1):
+                    keys.add(digits[:k])
+            for k in keys:
+                by_key.setdefault(k, []).append(mv)
+    for o in orders:
+        o.__dict__['_prefetched_return_movements'] = by_key.get(str(o.id), [])
+    # بنرجّع الموظفين علشان اللي بينادي يحتفظ بيهم فيفضلوا في الذاكرة طول الطلب
+    return users
+
+
+def _monthly_net_items_bulk(orders):
+    """صافي قطع كل موظف في كل شهر (مبيعات - مرتجعات) لكل الشهور اللي فيها فواتير الصفحة، في استعلامين بس.
+    بيطابق الحساب القديم بالظبط: المبيعات من كل المواسم، والمرتجعات من الموسم الحالي بس
+    (ده اللي كان فلتر الموسم بيعمله في الاستعلامات القديمة)."""
+    keys = {(o.user_id, o.date.year, o.date.month) for o in orders if o.user_id and o.date}
+    if not keys:
+        return {}
+    dates = [o.date for o in orders if o.user_id and o.date]
+    lo = min(dates)
+    hi = max(dates)
+    start = datetime(lo.year, lo.month, 1)
+    end = datetime(hi.year + 1, 1, 1) if hi.month == 12 else datetime(hi.year, hi.month + 1, 1)
+
+    so = SaleOrder.__table__.c
+    si = SaleItem.__table__.c
+    ri = ReturnInvoice.__table__.c
+    user_ids = list({k[0] for k in keys})
+
+    gross = {}
+    rows = db.session.query(so.user_id, so.date, si.quantity)\
+        .select_from(SaleItem.__table__.join(SaleOrder.__table__, si.order_id == so.id))\
+        .filter(so.user_id.in_(user_ids), so.is_proforma == False, so.date >= start, so.date < end).all()
+    for uid, d, q in rows:
+        if q is None or d is None:
+            continue
+        if isinstance(d, str):
+            d = datetime.fromisoformat(d)
+        k = (uid, d.year, d.month)
+        gross[k] = gross.get(k, 0) + q
+
+    rets = {}
+    active_season = session.get('active_season', 'شتوي 2027')
+    rows = db.session.query(so.user_id, ri.date, ri.total_qty)\
+        .select_from(ReturnInvoice.__table__.join(SaleOrder.__table__, ri.order_id == so.id))\
+        .filter(so.user_id.in_(user_ids), ri.season == active_season, ri.date >= start, ri.date < end).all()
+    for uid, d, q in rows:
+        if q is None or d is None:
+            continue
+        if isinstance(d, str):
+            d = datetime.fromisoformat(d)
+        k = (uid, d.year, d.month)
+        rets[k] = rets.get(k, 0) + q
+
+    cache = {}
+    for k in keys:
+        net = gross.get(k, 0) - rets.get(k, 0)
+        cache[k] = net if net > 0 else 0
+    return cache
+
+
+@app.route('/invoices')
+@login_required
+def invoices():
+    if not current_user.has_perm('view_invoices'):
+        return "غير مصرح لك", 403
+
+    # 1. تحديد نوع الفواتير المطلوبة من الرابط
+    # إذا كان الرابط ?type=proforma نعرض المسودات، غير ذلك نعرض الفواتير التامة
+    show_proforma = (request.args.get('type') == 'proforma')
+
+    accessible_ids = get_accessible_users()
+    
+    # جلب قائمة الكائنات للمستخدمين المتاحين (عشان نعرضهم في الفلتر)
+    accessible_users_list = User.query.filter(User.id.in_(accessible_ids)).all()
+
+    # 2. الاستعلام الأساسي (مع الفلتر الجديد)
+    query = SaleOrder.query.filter(SaleOrder.user_id.in_(accessible_ids))
+
+    # فلتر الموظف (لو تم اختياره)
+    selected_user_id = request.args.get('user_id')
+    if selected_user_id and selected_user_id.isdigit():
+        uid = int(selected_user_id)
+        # التأكد إن الموظف المختار ضمن صلاحياتي
+        if uid in accessible_ids:
+            query = query.filter(SaleOrder.user_id == uid)
+
+    # فلتر التاريخ (من - إلى)
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+
+    if start_date:
+        query = query.filter(SaleOrder.date >= f"{start_date} 00:00:00")
+    if end_date:
+        query = query.filter(SaleOrder.date <= f"{end_date} 23:59:59")
+
+    if show_proforma:
+        # عرض عروض الأسعار فقط
+        query = query.filter(SaleOrder.is_proforma == True)
+    else:
+        # عرض الفواتير التامة فقط
+        query = query.filter(SaleOrder.is_proforma == False)
+
+    # كل البيانات المرتبطة بالفواتير بتتجاب مرة واحدة بدل استعلام لكل فاتورة
+    from sqlalchemy.orm import selectinload
+    orders = query.options(
+        selectinload(SaleOrder.items).selectinload(SaleItem.variant),
+        selectinload(SaleOrder.returns),
+        selectinload(SaleOrder.return_invoices),
+        selectinload(SaleOrder.customer),
+        selectinload(SaleOrder.sales_rep),
+    ).order_by(SaleOrder.date.desc()).all()
+    _keep_users = _prefetch_invoice_list_data(orders)
+
+    # 3. حساب الإجماليات (للمدير العام فقط) - سيتم الحساب بناءً على القائمة المفلترة
+    is_gm = (current_user.username == 'gm_ahmed')
+    grand_totals = {
+        'total_cost': 0, 'total_sell': 0, 'total_profit': 0,
+        'total_comm': 0, 'total_company_net': 0, 'total_items': 0,
+        'total_gross_items': 0, 'total_returns_in_period': 0,
+        'total_ret_shipping': 0, 'total_ret_missing': 0, 'total_ret_deduction': 0,
+        'total_shipping': 0
+    }
+
+    # حساب إجمالي المرتجعات في الفترة (حسب تاريخ المرتجع، حتى لو البيع من شهر آخر)
+    ret_query = db.session.query(func.sum(ReturnInvoice.total_qty))
+    if selected_user_id and selected_user_id.isdigit() and int(selected_user_id) in accessible_ids:
+        ret_query = ret_query.join(SaleOrder).filter(SaleOrder.user_id == int(selected_user_id))
+    if start_date:
+        ret_query = ret_query.filter(ReturnInvoice.date >= f"{start_date} 00:00:00")
+    if end_date:
+        ret_query = ret_query.filter(ReturnInvoice.date <= f"{end_date} 23:59:59")
+    grand_totals['total_returns_in_period'] = ret_query.scalar() or 0
+
+    monthly_sales_cache = _monthly_net_items_bulk(orders)
+
+    def get_monthly_net_items(uid, o_date):
+        if not uid or not o_date: return 0
+        key = (uid, o_date.year, o_date.month)
+        if key in monthly_sales_cache:
+            return monthly_sales_cache[key]
+            
+        from datetime import datetime
+        start_date = datetime(o_date.year, o_date.month, 1)
+        if o_date.month == 12:
+            end_date = datetime(o_date.year + 1, 1, 1)
+        else:
+            end_date = datetime(o_date.year, o_date.month + 1, 1)
+            
+        gross_items = db.session.query(func.sum(SaleItem.quantity)).join(SaleOrder).filter(
+            SaleOrder.user_id == uid, 
+            SaleOrder.is_proforma == False, 
+            SaleOrder.date >= start_date, 
+            SaleOrder.date < end_date
+        ).scalar() or 0
+        
+        returns = db.session.query(func.sum(ReturnInvoice.total_qty))\
+            .join(SaleOrder)\
+            .filter(SaleOrder.user_id == uid,
+                    ReturnInvoice.date >= start_date,
+                    ReturnInvoice.date < end_date).scalar() or 0
+        
+        net_items = gross_items - returns
+        if net_items < 0: net_items = 0
+        
+        monthly_sales_cache[key] = net_items
+        return net_items
+
+    for o in orders:
+        # === بيانات المرتجعات ===
+        o.ret_date = None
+        o.ret_shipping_loss = 0
+        o.ret_missing_cost = 0
+        o.ret_total_deduction = 0
+        o.ret_total_qty = 0
+
+        if o.return_invoices:
+            latest = max(o.return_invoices, key=lambda r: r.date)
+            o.ret_date = latest.date
+            o.ret_shipping_loss = sum(r.shipping_loss or 0 for r in o.return_invoices)
+            o.ret_missing_cost = sum(r.missing_items_cost or 0 for r in o.return_invoices)
+            o.ret_total_deduction = sum(r.total_deduction or 0 for r in o.return_invoices)
+            o.ret_total_qty = sum(r.total_qty or 0 for r in o.return_invoices)
+
+        # نفس منطق الحساب القديم
+        o.real_cost = sum((i.variant.cost_price or 0) * i.quantity for i in o.items if i.variant)
+
+        # حساب الصافي بعد المرتجعات
+        seller = db.session.get(User, o.user_id) if o.user_id else None
+        o.est_comm = 0
+        order_qty = sum(i.quantity for i in o.items)
+        net_qty = max(0, order_qty - o.ret_total_qty)
+        o.net_comm = 0
+        o.display_qty = order_qty
+        o.display_ret_qty = o.ret_total_qty
+
+        # الإجمالي والتكلفة بعد خصم المرتجعات (بالأسعار الحقيقية)
+        if order_qty > 0 and o.ret_total_qty > 0:
+            # حساب قيمة القطع المرتجعة من حركات المخزون
+            movements = o.return_movements()
+            returned_value = 0.0
+            returned_cost = 0.0
+            # ربط حركة المخزون بسعر القطعة في الفاتورة
+            items_by_variant = {i.variant_id: i for i in o.items}
+            for mv in movements:
+                sale_item = items_by_variant.get(mv.variant_id)
+                if sale_item:
+                    returned_value += mv.quantity_change * sale_item.unit_price
+                if mv.variant:
+                    returned_cost += mv.quantity_change * (mv.variant.cost_price or 0)
+            o.net_total = round((o.total_amount or 0) - returned_value, 2)
+            o.net_cost = round(o.real_cost - returned_cost, 2)
+        else:
+            o.net_total = o.total_amount or 0
+            o.net_cost = o.real_cost
+
+        is_under_partner = False
+        if seller:
+            if seller.role == 'manager':
+                is_under_partner = True
+            elif seller.manager_id:
+                mgr = db.session.get(User, seller.manager_id)
+                if mgr and mgr.role == 'manager':
+                    is_under_partner = True
+
+            actual_discount = (o.discount or 0) if net_qty > 0 else 0
+
+            if is_under_partner:
+                partner_obj = seller if seller.role == 'manager' else db.session.get(User, seller.manager_id)
+                p_rate = float(partner_obj.commission_value or 15.0) if partner_obj else 15.0
+                o.est_comm = net_qty * p_rate
+                o.net_comm = o.est_comm - actual_discount - o.ret_total_deduction
+            else:
+                monthly_net = get_monthly_net_items(seller.id, o.date)
+                o.est_comm = calculate_user_commission(seller, net_qty, monthly_net)
+                o.net_comm = o.est_comm
+
+        actual_discount = (o.discount or 0) if net_qty > 0 else 0
+
+        # حساب ربح الشركة بالصافي بعد المرتجعات
+        revenue_for_company = o.net_total - actual_discount - (o.shipping_fee or 0)
+        
+        if is_under_partner:
+            o.company_bears_discount = False
+        else:
+            o.company_bears_discount = True if actual_discount > 0 else False
+
+        o.gross_profit = round(revenue_for_company - o.net_cost, 2)
+        o.company_net = round(o.gross_profit - o.net_comm, 2)
+
+        if is_gm:
+            grand_totals['total_cost'] = round(grand_totals['total_cost'] + o.net_cost, 2)
+            grand_totals['total_sell'] = round(grand_totals['total_sell'] + o.net_total, 2)
+            grand_totals['total_profit'] = round(grand_totals['total_profit'] + o.gross_profit, 2)
+            grand_totals['total_comm'] = round(grand_totals['total_comm'] + o.net_comm, 2)
+            grand_totals['total_company_net'] = round(grand_totals['total_company_net'] + o.company_net, 2)
+            grand_totals['total_items'] += net_qty
+            grand_totals['total_gross_items'] += order_qty
+            grand_totals['total_shipping'] = round(grand_totals['total_shipping'] + (o.shipping_fee or 0), 2)
+            grand_totals['total_ret_shipping'] = round(grand_totals['total_ret_shipping'] + o.ret_shipping_loss, 2)
+            grand_totals['total_ret_missing'] = round(grand_totals['total_ret_missing'] + o.ret_missing_cost, 2)
+            grand_totals['total_ret_deduction'] = round(grand_totals['total_ret_deduction'] + o.ret_total_deduction, 2)
+
+    return render_template('invoices.html',
+                           orders=orders,
+                           is_gm=is_gm,
+                           grand_totals=grand_totals,
+                           is_proforma_view=show_proforma,
+                           accessible_users=accessible_users_list, # قائمة الموظفين للفلترة
+                           selected_user_id=int(selected_user_id) if selected_user_id and selected_user_id.isdigit() else None,
+                           start_date=start_date,
+                           end_date=end_date,
+                           money_accounts=MoneyAccount.get_ordered())
+
+
+@app.route('/api/invoice/<int:order_id>/add_payment', methods=['POST'])
+@login_required
+def add_invoice_payment(order_id):
+    if current_user.fullname != "أحمد عبد الفتاح" and current_user.username != "gm_ahmed":
+        return jsonify({'success': False, 'message': 'غير مصرح لك بإضافة مدفوعات للفاتورة.'})
+    
+    order = SaleOrder.query.get_or_404(order_id)
+    amount = float(request.form.get('amount', 0))
+    account_id = request.form.get('account_id')
+    
+    if amount <= 0:
+        return jsonify({'success': False, 'message': 'المبلغ غير صالح.'})
+        
+    if not account_id:
+        return jsonify({'success': False, 'message': 'يجب اختيار خزينة.'})
+        
+    account = MoneyAccount.query.get(account_id)
+    if not account:
+        return jsonify({'success': False, 'message': 'الخزينة غير صحيحة.'})
+        
+    # Update order paid upfront and amount due
+    order.paid_upfront = round(order.paid_upfront + amount, 1)
+    
+    # Calculate amount due correctly based on current shipping fees
+    fee = order.shipping_fee or 0.0
+    order.amount_due = round(order.final_total + fee - order.paid_upfront, 1)
+    
+    # Update treasury balance
+    account.balance = round(account.balance + amount, 1)
+    
+    # Record financial transaction
+    transaction = FinancialTransaction(
+        type='income',
+        category='تحصيل مبيعات إضافي',
+        amount=amount,
+        description=f'تحصيل إضافي لفاتورة رقم #{order.id} من شركة الشحن',
+        account_id=account.id,
+        created_by_id=current_user.id,
+        date=cairo_now()
+    )
+    db.session.add(transaction)
+    
+    db.session.commit()
+    
+    return jsonify({'success': True, 'message': f'تم إضافة الدفعة بنجاح. المتبقي للتحصيل: {order.amount_due}'})
+
+
+@app.route('/api/invoice/<int:order_id>/payment_details')
+@login_required
+def invoice_payment_details(order_id):
+    order = SaleOrder.query.get_or_404(order_id)
+    payments = []
+    
+    # البحث عن الحركات المالية المرتبطة (بكلمة فاتورة أو رقم الفاتورة أو رقم البوليصة)
+    waybill_filter = f"%{order.waybill_no}%" if order.waybill_no else "---"
+    # نجلب كل الحركات اللي فيها الرقم كجزء من النص أولاً
+    potential_trans = FinancialTransaction.query.filter(
+        db.or_(
+            FinancialTransaction.description.like(f"%#{order_id}%"),
+            FinancialTransaction.description.like(waybill_filter)
+        )
+    ).all()
+    
+    # تصفية دقيقة باستخدام Regex في بايثون للتأكد من تطابق الرقم بالكامل
+    import re
+    trans = []
+    for t in potential_trans:
+        # 1. التحقق من رقم الفاتورة (يجب أن يكون مسبوقاً بـ # ومطابقاً تماماً)
+        id_match = re.search(rf'#{order_id}(\b|[^\d])', t.description)
+        
+        # 2. التحقق من رقم البوليصة (لو موجود ومطابق تماماً)
+        waybill_match = False
+        if order.waybill_no:
+            # لو رقم البوليصة قصير (أقل من 4 أرقام)، لازم نتأكد إنه مسبوق بكلمة 'بوليصة' 
+            # وكمان نتأكد إن اسم العميل (أو جزء منه) موجود في الوصف لزيادة الدقة
+            waybill_pattern = rf'(بوليصة|شحنة|باقة).*?{order.waybill_no}(\b|[^\d])'
+            if len(str(order.waybill_no)) < 4:
+                # التحقق من الرقم + اسم العميل (أول كلمة من الاسم كافية للفلترة)
+                first_name = order.customer.name.split()[0] if order.customer and order.customer.name else ""
+                has_waybill = re.search(waybill_pattern, t.description)
+                has_customer = first_name in t.description if first_name else True
+                waybill_match = has_waybill and has_customer
+            else:
+                waybill_match = re.search(waybill_pattern, t.description)
+        
+        if id_match or waybill_match:
+            trans.append(t)
+    
+    # ترتيب الحركات حسب التاريخ
+    trans.sort(key=lambda x: x.date)
+    
+    total_paid = 0
+    for i, t in enumerate(trans, 1):
+        if 'مرتجع' in t.description or 'استرداد' in t.description:
+            p_type = 'استرداد'
+        elif 'شحن' in t.description:
+            p_type = 'تحصيل شحن'
+        else:
+            p_type = 'دفعة'
+            
+        payments.append({
+            'index': i,
+            'date': t.date.strftime('%Y-%m-%d %I:%M %p'),
+            'amount': abs(t.amount),
+            'account': t.account.name if t.account else ('حساب العميل' if t.type == 'debt_adjustment' else 'مجهول'),
+            'type_label': p_type,
+            'description': t.description,
+            'is_in': t.amount > 0
+        })
+        if t.amount > 0:
+            total_paid += t.amount
+        else:
+            total_paid -= abs(t.amount)
+            
+    # إضافة سطر لمصاريف الشحن (لو موجودة) عشان الحسبة تقفل في وش المستخدم
+    if order.shipping_fee and order.shipping_fee > 0:
+        payments.append({
+            'index': len(payments) + 1,
+            'date': order.shipping_settled_date.strftime('%Y-%m-%d %I:%M %p') if order.shipping_settled_date else '---',
+            'amount': order.shipping_fee,
+            'account': 'شركة الشحن (خصم)',
+            'type_label': 'مصاريف شحن',
+            'description': f'عمولة شركة الشحن (بوليصة {order.waybill_no})',
+            'is_in': False # بنخليها باللون الأحمر كأنها مصروف
+        })
+        
+    return jsonify({
+        'invoice_id': order.id,
+        'total_invoice': order.final_total,
+        'total_paid': total_paid + (order.shipping_fee or 0),
+        'amount_due': order.amount_due,
+        'payments': payments
+    })
+
+
+@app.route('/api/invoice/<int:order_id>/commission_details')
+@login_required
+@general_manager_required
+def invoice_commission_details(order_id):
+    order = db.session.get(SaleOrder, order_id)
+    if not order:
+        return jsonify({'error': 'Invoice not found'}), 404
+
+    order_qty = sum(item.quantity for item in order.items)
+    seller = db.session.get(User, order.user_id) if order.user_id else None
+    
+    # بيانات المرتجعات
+    ret_total_qty = sum(r.total_qty or 0 for r in order.return_invoices) if order.return_invoices else 0
+    ret_total_deduction = sum(r.total_deduction or 0 for r in order.return_invoices) if order.return_invoices else 0
+    ret_shipping_loss = sum(r.shipping_loss or 0 for r in order.return_invoices) if order.return_invoices else 0
+    ret_missing_cost = sum(r.missing_items_cost or 0 for r in order.return_invoices) if order.return_invoices else 0
+    net_qty = max(0, order_qty - ret_total_qty)
+
+    details = {
+        'order_id': order.id,
+        'order_qty': order_qty,
+        'ret_qty': ret_total_qty,
+        'net_qty': net_qty,
+        'total_amount': order.total_amount,
+        'discount': order.discount or 0.0,
+        'ret_total_deduction': ret_total_deduction,
+        'is_under_partner': False,
+        'seller_name': seller.fullname if seller else 'غير معروف',
+        'est_comm': 0.0,
+        'net_comm': 0.0,
+        'calculation_method': '',
+        'breakdown': []
+    }
+
+    if seller:
+        is_under_partner = False
+        if seller.role == 'manager': is_under_partner = True
+        elif seller.manager_id:
+            mgr = db.session.get(User, seller.manager_id)
+            if mgr and mgr.role == 'manager': is_under_partner = True
+        
+        details['is_under_partner'] = is_under_partner
+
+        if is_under_partner:
+            partner_obj = seller if seller.role == 'manager' else db.session.get(User, seller.manager_id)
+            p_rate = float(partner_obj.commission_value or 15.0) if partner_obj else 15.0
+            details['calculation_method'] = 'عمولة شريك (المدير يتحمل الخصم من عمولته)'
+            details['est_comm'] = net_qty * p_rate
+            details['net_comm'] = details['est_comm'] - details['discount'] - ret_total_deduction
+            details['breakdown'].append({'text': f'عدد القطع الإجمالي: {order_qty}', 'color': 'secondary'})
+            if ret_total_qty > 0:
+                details['breakdown'].append({'text': f'مرتجع: -{ret_total_qty} قطعة → الصافي: {net_qty} قطعة', 'color': 'warning'})
+            details['breakdown'].append({'text': f'عمولة الشريك: {net_qty} × {p_rate} = {details["est_comm"]} ج.م', 'color': 'success'})
+            if details['discount'] > 0:
+                details['breakdown'].append({'text': f'خصم الفاتورة (يُطرح من عمولة المدير): -{details["discount"]} ج.م', 'color': 'danger'})
+            if ret_shipping_loss > 0:
+                details['breakdown'].append({'text': f'خسارة شحن مرتجع: -{ret_shipping_loss} ج.م', 'color': 'danger'})
+            if ret_missing_cost > 0:
+                details['breakdown'].append({'text': f'تكلفة نواقص/تالف: -{ret_missing_cost} ج.م', 'color': 'danger'})
+            details['breakdown'].append({'text': f'صافي العمولة النهائي: {details["net_comm"]} ج.م', 'color': 'dark'})
+        else:
+            details['calculation_method'] = 'عمولة مباشرة (الشركة تتحمل الخصم)'
+            def get_monthly_items(uid, o_date):
+                start_date = o_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                if start_date.month == 12: end_date = start_date.replace(year=start_date.year + 1, month=1)
+                else: end_date = start_date.replace(month=start_date.month + 1)
+                gross = db.session.query(func.sum(SaleItem.quantity)).join(SaleOrder).filter(
+                    SaleOrder.user_id == uid, SaleOrder.date >= start_date, SaleOrder.date < end_date
+                ).scalar() or 0
+                ret = db.session.query(func.sum(ReturnInvoice.total_qty))\
+                    .join(SaleOrder)\
+                    .filter(SaleOrder.user_id == uid,
+                            ReturnInvoice.date >= start_date,
+                            ReturnInvoice.date < end_date).scalar() or 0
+                return max(0, gross - ret)
+
+            monthly_net = get_monthly_items(seller.id, order.date)
+            details['est_comm'] = calculate_user_commission(seller, net_qty, monthly_net)
+            details['net_comm'] = details['est_comm']
+            details['breakdown'].append({'text': f'إجمالي مبيعات البائعة هذا الشهر: {monthly_net} قطعة', 'color': 'secondary'})
+            if ret_total_qty > 0:
+                details['breakdown'].append({'text': f'مرتجع من هذه الفاتورة: -{ret_total_qty} قطعة (الصافي: {net_qty})', 'color': 'warning'})
+            details['breakdown'].append({'text': f'بناءً على الشريحة المستحقة: العمولة = {details["est_comm"]} ج.م', 'color': 'success'})
+            if details['discount'] > 0:
+                details['breakdown'].append({'text': f'تنبيه: الخصم ({details["discount"]} ج.م) تتحمله الشركة ولا يؤثر على عمولة البائعة.', 'color': 'info'})
+    
+    return jsonify(details)
+
+
+# =========================================================================
+# === الفاتورة التسويقية / الوهمية (خاصة بالأستاذ أحمد عبد الفتاح فقط) ===
+# =========================================================================
+
+class MockCategory:
+    def __init__(self, name):
+        self.name = name or 'عام'
+
+class MockModel:
+    def __init__(self, name, cat_name):
+        self.name = name or 'منتج'
+        self.category = MockCategory(cat_name)
+
+class MockVariant:
+    def __init__(self, code, name, cat_name):
+        self.id = code or '---'
+        self.barcode = code or '---'
+        self.model = MockModel(name, cat_name)
+
+class MockCustomer:
+    def __init__(self, name, phone, address):
+        self.name = name or 'عميل نقدي'
+        self.phone = phone or '---'
+        self.address = address or '---'
+
+class MockSalesRep:
+    def __init__(self, code, phone, role):
+        self.emp_code = code or 'M-01'
+        self.phone = phone or ''
+        self.role = role or 'general_manager'
+        self.manager = None
+
+class MockPacker:
+    def __init__(self, code):
+        self.emp_code = code or 'P-01'
+
+class MockItem:
+    def __init__(self, name, cat_name, code, qty, price):
+        self.variant_id = code or '---'
+        self.variant = MockVariant(code, name, cat_name)
+        self.quantity = int(qty or 0)
+        self.unit_price = float(price or 0.0)
+        self.total_price = self.quantity * self.unit_price
+
+class MockOrder:
+    def __init__(self, inv_id, cust, date_val, items, discount=0.0, paid=0.0, sales_code='M-01', packer_code='P-01'):
+        self.id = inv_id
+        self.is_proforma = False
+        self.customer = cust
+        self.customer_id = 0
+        self.date = date_val
+        self.items = items
+        self.total_amount = sum(i.total_price for i in items)
+        self.discount = float(discount or 0.0)
+        self.final_total = max(0.0, self.total_amount - self.discount)
+        self.paid_upfront = float(paid or 0.0)
+        self.is_shipping = False
+        self.return_invoices = []
+        self.sales_rep = MockSalesRep(sales_code, getattr(current_user, 'phone', '01000000000') or '', 'general_manager')
+        self.packer = MockPacker(packer_code) if packer_code else None
+
+@app.route('/marketing/mock_invoice', methods=['GET'])
+@login_required
+def mock_invoice_form():
+    # مسموحة للأستاذ أحمد عبد الفتاح أو أي مدير يملك صلاحية الفاتورة التسويقية
+    if not (current_user.username == 'gm_ahmed' or current_user.has_perm('mock_invoice')):
+        abort(403)
+
+    variants = ProductVariant.query.join(ProductModel).order_by(ProductModel.name).all()
+    customers = Customer.query.order_by(Customer.name).all()
+    categories = Category.query.order_by(Category.name).all()
+
+    max_id = db.session.query(func.max(SaleOrder.id)).scalar() or 4000
+    suggested_inv_no = max_id + 4260  # مثل 8950
+
+    return render_template('mock_invoice_form.html',
+                           variants=variants,
+                           customers=customers,
+                           categories=categories,
+                           suggested_inv_no=suggested_inv_no,
+                           now_str=cairo_now().strftime('%Y-%m-%d'))
+
+@app.route('/marketing/mock_invoice/preview', methods=['POST'])
+@login_required
+def mock_invoice_preview():
+    # مسموحة للأستاذ أحمد عبد الفتاح أو أي مدير يملك صلاحية الفاتورة التسويقية
+    if not (current_user.username == 'gm_ahmed' or current_user.has_perm('mock_invoice')):
+        abort(403)
+
+    inv_no = request.form.get('invoice_no', '').strip() or '8950'
+    date_str = request.form.get('invoice_date', '').strip()
+    try:
+        if date_str:
+            d = datetime.strptime(date_str, '%Y-%m-%d')
+            now = cairo_now()
+            inv_date = d.replace(hour=now.hour, minute=now.minute, second=now.second)
+        else:
+            inv_date = cairo_now()
+    except Exception:
+        inv_date = cairo_now()
+
+    cust_name = request.form.get('customer_name', '').strip() or 'عميل تجاري'
+    cust_phone = request.form.get('customer_phone', '').strip() or '01000000000'
+    cust_address = request.form.get('customer_address', '').strip() or 'القاهرة'
+
+    sales_code = request.form.get('sales_rep_code', '').strip() or 'M-01'
+    packer_code = request.form.get('packer_code', '').strip() or 'P-01'
+
+    discount = float(request.form.get('discount', 0) or 0)
+    paid_upfront = float(request.form.get('paid_upfront', 0) or 0)
+
+    names = request.form.getlist('item_name[]')
+    cats = request.form.getlist('item_category[]')
+    codes = request.form.getlist('item_code[]')
+    qtys = request.form.getlist('item_qty[]')
+    prices = request.form.getlist('item_price[]')
+
+    items = []
+    for i in range(len(names)):
+        name = names[i].strip() if i < len(names) else ''
+        if not name:
+            continue
+        cat = cats[i].strip() if i < len(cats) else 'عام'
+        code = codes[i].strip() if i < len(codes) else '---'
+        try:
+            qty = int(qtys[i]) if i < len(qtys) else 1
+        except (ValueError, TypeError):
+            qty = 1
+        try:
+            price = float(prices[i]) if i < len(prices) else 0.0
+        except (ValueError, TypeError):
+            price = 0.0
+
+        items.append(MockItem(name=name, cat_name=cat, code=code, qty=qty, price=price))
+
+    if not items:
+        items.append(MockItem(name='صنف تجاري ممتاز', cat_name='ملابس', code='1001', qty=1000, price=250.0))
+
+    mock_cust = MockCustomer(name=cust_name, phone=cust_phone, address=cust_address)
+    mock_order = MockOrder(
+        inv_id=inv_no,
+        cust=mock_cust,
+        date_val=inv_date,
+        items=items,
+        discount=discount,
+        paid=paid_upfront,
+        sales_code=sales_code,
+        packer_code=packer_code
+    )
+
+    return render_template('invoice.html', order=mock_order, return_map={}, return_stats=None, is_mock=True)
+
+

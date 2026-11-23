@@ -1,0 +1,37 @@
+# Environments
+venv/
+env/
+.venv
+
+# Python
+__pycache__/
+
+# Database
+*.db
+*.bak
+*.sqlite
+*.sqlite3
+
+# App specific
+static/uploads/
+
+# IDEs / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Extra ignore files
+static/reports/
+backend/scratch/
+.fastaccess
+backups/
+*.zip
+service_account*.json
+# Secrets & data dumps (never commit)
+.env
+.env.*
+!.env.example
+user_pass.json
+users_dump.json
+debug_comm_log.txt

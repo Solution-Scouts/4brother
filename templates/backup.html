@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>النسخ الاحتياطي - خاص بالمدير العام</title>
+    
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <style>
+        :root { 
+            --main-color: {{ theme_color or '#0d6efd' }};
+            --bg-body: #f4f6f9;
+        }
+        
+        body { 
+            background-color: var(--bg-body); 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: #333;
+        }
+
+        .backup-navbar {
+            background: white;
+            height: 65px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.04);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 25px;
+            margin-bottom: 30px;
+        }
+
+        .vip-badge {
+            background: linear-gradient(135deg, #ffd700, #ffaa00);
+            color: #000;
+            font-weight: 800;
+            padding: 6px 14px;
+            border-radius: 50px;
+            font-size: 0.85rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            box-shadow: 0 2px 6px rgba(255, 170, 0, 0.3);
+        }
+
+        .stat-card {
+            background: white;
+            border-radius: 16px;
+            padding: 20px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.03);
+            border: 1px solid rgba(0,0,0,0.05);
+            transition: transform 0.2s;
+        }
+        .stat-card:hover {
+            transform: translateY(-2px);
+        }
+
+        .action-card {
+            background: white;
+            border-radius: 18px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.05);
+            border: none;
+            overflow: hidden;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            transition: all 0.25s ease-in-out;
+        }
+        .action-card:hover {
+            box-shadow: 0 8px 28px rgba(0,0,0,0.09);
+            transform: translateY(-3px);
+        }
+
+        .action-header {
+            padding: 20px 24px;
+            font-weight: bold;
+            font-size: 1.15rem;
+            color: white;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .loading-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 999999;
+            color: white;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+        }
+    </style>
+</head>
+<body>
+
+<!-- Loading Overlay -->
+<div id="loadingOverlay" class="loading-overlay">
+    <div class="spinner-border text-light mb-3" style="width: 3.5rem; height: 3.5rem;" role="status"></div>
+    <h4 class="fw-bold mb-2">جاري تجهيز النسخة الاحتياطية...</h4>
+    <p class="text-white-50">يتم تجميع البيانات وضغطها الآن، يرجى الانتظار ثوانٍ معدودة.</p>
+</div>
+
+<!-- Navbar -->
+<nav class="backup-navbar">
+    <div class="d-flex align-items-center">
+        <a href="/dashboard" class="btn btn-light btn-sm rounded-circle me-3"><i class="fas fa-arrow-right"></i></a>
+        <h5 class="m-0 fw-bold text-dark"><i class="fas fa-database text-primary me-2"></i> مركز النسخ الاحتياطي السحابي</h5>
+    </div>
+    <div>
+        <span class="vip-badge">
+            <i class="fas fa-crown"></i> مخصص للأستاذ أحمد عبد الفتاح
+        </span>
+    </div>
+</nav>
+
+<div class="container pb-5">
+    
+    <!-- Flash Messages -->
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            {% for category, message in messages %}
+            <div class="alert alert-{{ category }} shadow-sm border-0 rounded-4 mb-4 d-flex align-items-center">
+                <i class="fas fa-info-circle me-2 fa-lg"></i>
+                <div class="fw-bold">{{ message }}</div>
+            </div>
+            {% endfor %}
+        {% endif %}
+    {% endwith %}
+
+    <!-- Info Stats -->
+    <div class="row g-3 mb-4">
+        <div class="col-md-3 col-6">
+            <div class="stat-card text-center">
+                <div class="text-muted small fw-bold mb-1"><i class="fas fa-table text-primary me-1"></i> جداول قاعدة البيانات</div>
+                <h3 class="fw-bold m-0 text-dark">27 جدولاً</h3>
+            </div>
+        </div>
+        <div class="col-md-3 col-6">
+            <div class="stat-card text-center">
+                <div class="text-muted small fw-bold mb-1"><i class="fas fa-shirt text-success me-1"></i> موديلات المنتجات</div>
+                <h3 class="fw-bold m-0 text-dark">{{ total_models }} موديل</h3>
+            </div>
+        </div>
+        <div class="col-md-3 col-6">
+            <div class="stat-card text-center">
+                <div class="text-muted small fw-bold mb-1"><i class="fas fa-layer-group text-warning me-1"></i> أصناف ومقاسات المنتجات</div>
+                <h3 class="fw-bold m-0 text-dark">{{ total_variants }} صنف</h3>
+            </div>
+        </div>
+        <div class="col-md-3 col-6">
+            <div class="stat-card text-center">
+                <div class="text-muted small fw-bold mb-1"><i class="fas fa-images text-info me-1"></i> صور التخزين السحابي</div>
+                <h3 class="fw-bold m-0 text-dark">255+ صورة</h3>
+            </div>
+        </div>
+    </div>
+
+    <!-- Action Cards -->
+    <div class="row g-4 mb-5">
+        
+        <!-- Direct DB Download -->
+        <div class="col-lg-4 col-md-6">
+            <div class="action-card">
+                <div>
+                    <div class="action-header bg-primary">
+                        <i class="fas fa-file-zipper fa-lg"></i>
+                        <span>تحميل قاعدة البيانات فوراً</span>
+                    </div>
+                    <div class="p-4">
+                        <p class="text-muted small leading-relaxed">
+                            يقوم فوراً بسحب نسخة طبق الأصل من جميع جداول PostgreSQL وتصديرها كملف SQLite مضغوط <code>.zip</code> وتنزيلها مباشرة إلى جهازك.
+                        </p>
+                        <ul class="list-unstyled small text-muted mb-4">
+                            <li><i class="fas fa-check text-success me-1"></i> يشمل كل الفواتير، الحسابات، العملاء والعمال.</li>
+                            <li><i class="fas fa-bolt text-warning me-1"></i> سريع جداً (يستغرق ثوانٍ معدودة فقط).</li>
+                        </ul>
+                    </div>
+                </div>
+                <div class="p-4 pt-0">
+                    <a href="/admin/backup/download?type=db" class="btn btn-primary w-100 rounded-pill py-2 fw-bold shadow-sm" onclick="triggerLoading()">
+                        <i class="fas fa-download me-1"></i> تنزيل قاعدة البيانات الآن (ZIP)
+                    </a>
+                </div>
+            </div>
+        </div>
+
+        <!-- Full Archive with Images -->
+        <div class="col-lg-4 col-md-6">
+            <div class="action-card">
+                <div>
+                    <div class="action-header" style="background: #2b3035;">
+                        <i class="fas fa-box-archive fa-lg text-warning"></i>
+                        <span>تحميل شامل (بيانات + صور)</span>
+                    </div>
+                    <div class="p-4">
+                        <p class="text-muted small leading-relaxed">
+                            يقوم بتجميع قاعدة البيانات كاملة وتنزيل جميع صور الموديلات والمنتجات من خوادم التخزين السحابي وحزمها في أرشيف واحد شامل.
+                        </p>
+                        <ul class="list-unstyled small text-muted mb-4">
+                            <li><i class="fas fa-check text-success me-1"></i> يشمل قاعدة البيانات كاملة.</li>
+                            <li><i class="fas fa-check text-success me-1"></i> يشمل جميع صور المنتجات والموديلات (255 صورة).</li>
+                        </ul>
+                    </div>
+                </div>
+                <div class="p-4 pt-0">
+                    <a href="/admin/backup/download?type=full" class="btn btn-dark w-100 rounded-pill py-2 fw-bold shadow-sm" onclick="triggerLoading()">
+                        <i class="fas fa-cloud-download-alt me-1"></i> تنزيل النسخة الشاملة (ZIP)
+                    </a>
+                </div>
+            </div>
+        </div>
+
+        <!-- Send to Telegram Now -->
+        <div class="col-lg-4 col-md-12">
+            <div class="action-card">
+                <div>
+                    <div class="action-header" style="background: #0088cc;">
+                        <i class="fab fa-telegram-plane fa-lg"></i>
+                        <span>إرسال فوري إلى التيليجرام</span>
+                    </div>
+                    <div class="p-4">
+                        <p class="text-muted small leading-relaxed">
+                            يرسل طلباً لتجهيز نسخة كاملة وإرسالها فوراً إلى محادثتك على التيليجرام كملف مستند مرفق يصلك على هاتفك في أقل من دقيقة.
+                        </p>
+                        <ul class="list-unstyled small text-muted mb-4">
+                            <li><i class="fas fa-check text-success me-1"></i> يصل مباشرة على حسابك عبر البوت.</li>
+                            <li><i class="fas fa-shield-alt text-info me-1"></i> نسخة أمان إضافية محفوظة في سحابة تليجرام.</li>
+                        </ul>
+                    </div>
+                </div>
+                <div class="p-4 pt-0">
+                    <form method="POST" action="/admin/backup/send-telegram" onsubmit="triggerLoading()">
+                        <button type="submit" class="btn btn-info text-white w-100 rounded-pill py-2 fw-bold shadow-sm mb-2" style="background: #0088cc;">
+                            <i class="fab fa-telegram-plane me-1"></i> إرسال النسخة للتيليجرام الآن
+                        </button>
+                    </form>
+                    <a href="/admin/backup/setup-telegram-webhook" class="btn btn-sm btn-outline-secondary rounded-pill w-100 py-1" title="يربط البوت لكي يرد عليك عند إرسال كلمة باك اب">
+                        <i class="fas fa-robot me-1"></i> تفعيل استقبال الأوامر من التيليجرام
+                    </a>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Recent Local Backups Table -->
+    {% if recent_backups %}
+    <div class="card border-0 shadow-sm rounded-4 overflow-hidden mb-4">
+        <div class="card-header bg-white py-3 border-0">
+            <h6 class="m-0 fw-bold text-dark"><i class="fas fa-history text-muted me-2"></i> النسخ الاحتياطية المتوفرة على السيرفر</h6>
+        </div>
+        <div class="table-responsive">
+            <table class="table table-hover align-middle mb-0">
+                <thead class="table-light">
+                    <tr>
+                        <th class="ps-4">اسم الملف</th>
+                        <th>الحجم</th>
+                        <th>تاريخ الإنشاء</th>
+                        <th class="text-end pe-4">تحميل</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for b in recent_backups %}
+                    <tr>
+                        <td class="ps-4 fw-bold">
+                            <i class="fas fa-file-archive text-warning me-2"></i>
+                            <code>{{ b.filename }}</code>
+                        </td>
+                        <td><span class="badge bg-secondary">{{ b.size_mb }} MB</span></td>
+                        <td class="text-muted">{{ b.date }}</td>
+                        <td class="text-end pe-4">
+                            <a href="/admin/backup/download?file={{ b.filename }}" class="btn btn-sm btn-outline-primary rounded-pill px-3">
+                                <i class="fas fa-download me-1"></i> تحميل
+                            </a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+</div>
+
+<script>
+    function triggerLoading() {
+        document.getElementById('loadingOverlay').style.display = 'flex';
+        // Auto hide after 20 seconds if browser download prompt intercepted it
+        setTimeout(function() {
+            document.getElementById('loadingOverlay').style.display = 'none';
+        }, 20000);
+    }
+</script>
+
+</body>
+</html>
+
