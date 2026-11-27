@@ -61,6 +61,69 @@
         {% endif %}
         {% endwith %}
 
+        {% if preview %}
+        <!-- شاشة التأكيد: لسه ما اتحصّلش حاجة -->
+        <div class="card shadow-sm border-0 mb-4">
+            <div class="card-header bg-warning text-dark text-center">
+                <h5 class="mb-0 fw-bold"><i class="fas fa-search-dollar"></i> راجع البوالص قبل التحصيل</h5>
+                <small>لسه ما اتحصّلش أي حاجة — اتأكد من اسم العميل والمبلغ لكل بوليصة</small>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table table-bordered text-center align-middle mb-0">
+                        <thead class="table-light">
+                            <tr>
+                                <th>#</th><th>البوليصة</th><th>الفاتورة</th><th>العميل</th><th>الحالة</th>
+                                <th>المبلغ</th><th>مصاريف الشحن</th><th>الصافي للخزينة</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for r in preview.rows %}
+                            <tr class="{{ '' if r.ok else 'table-danger' }}">
+                                <td>{{ loop.index }}</td>
+                                <td class="fw-bold">{{ r.waybill }}</td>
+                                <td>{% if r.order_id %}<a href="/invoice/print/{{ r.order_id }}" target="_blank">#{{ r.order_id }}</a>{% else %}-{% endif %}</td>
+                                <td>{{ r.customer or '-' }}</td>
+                                {% if r.ok %}
+                                <td>{{ r.status }}</td>
+                                <td>{{ "{:,.2f}".format(r.amount) }}</td>
+                                <td class="text-danger">{{ "{:,.2f}".format(r.fee) }}</td>
+                                <td class="fw-bold text-success">{{ "{:,.2f}".format(r.net) }}</td>
+                                {% else %}
+                                <td colspan="4" class="text-danger fw-bold">⚠️ {{ r.error }} — مش هتتحصّل</td>
+                                {% endif %}
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                        <tfoot>
+                            <tr class="table-light fw-bold">
+                                <td colspan="5" class="text-end">الإجمالي ({{ preview.ok_count }} بوليصة هتتحصّل):</td>
+                                <td>{{ "{:,.2f}".format(preview.total_amount) }}</td>
+                                <td class="text-danger">{{ "{:,.2f}".format(preview.total_fee) }}</td>
+                                <td class="text-success">{{ "{:,.2f}".format(preview.total_net) }}</td>
+                            </tr>
+                        </tfoot>
+                    </table>
+                </div>
+            </div>
+            <div class="card-footer bg-white">
+                <p class="mb-2 text-center">هيتضاف <b class="text-success">{{ "{:,.2f}".format(preview.total_net) }} ج.م</b> على خزينة <b>{{ preview.account.name }}</b></p>
+                {% if preview.ok_count %}
+                <form method="POST" action="/shipping/bulk_collect">
+                    <input type="hidden" name="step" value="confirm">
+                    <input type="hidden" name="account_id" value="{{ preview.account.id }}">
+                    <textarea name="waybills" class="d-none">{% for r in preview.rows if r.ok %}{{ r.waybill }}
+{% endfor %}</textarea>
+                    <button type="submit" class="btn btn-success fw-bold w-100 py-3">
+                        <i class="fas fa-check-double"></i> تأكيد تحصيل {{ preview.ok_count }} بوليصة
+                    </button>
+                </form>
+                {% endif %}
+                <a href="/shipping/bulk_collect" class="btn btn-outline-secondary w-100 mt-2">إلغاء</a>
+            </div>
+        </div>
+        {% endif %}
+
         <div class="card shadow-sm border-0 collect-card">
             <div class="card-header bg-dark text-white text-center">
                 <h5 class="mb-0 fw-bold"><i class="fas fa-barcode"></i> أدخل أرقام البوالص</h5>
@@ -71,7 +134,7 @@
                     <div class="mb-3">
                         <label class="form-label fw-bold">أرقام البوالص *</label>
                         <textarea name="waybills" class="form-control" rows="8"
-                            placeholder="مثال:&#10;8477790&#10;8477791&#10;8477792" required></textarea>
+                            placeholder="مثال:&#10;8477790&#10;8477791&#10;8477792" required>{{ preview.waybills_text if preview else '' }}</textarea>
                         <div class="form-text text-muted">
                             <i class="fas fa-info-circle"></i> ضع كل رقم بوليصة في سطر منفصل
                         </div>
@@ -82,14 +145,13 @@
                         <select name="account_id" class="form-select" required>
                             <option value="" disabled selected>-- اختر الخزينة --</option>
                             {% for acc in accounts %}
-                            <option value="{{ acc.id }}">{{ acc.name }}</option>
+                            <option value="{{ acc.id }}" {% if preview and preview.account.id == acc.id %}selected{% endif %}>{{ acc.name }}</option>
                             {% endfor %}
                         </select>
                     </div>
 
-                    <button type="submit" class="btn btn-success fw-bold w-100 py-3"
-                        onclick="return confirm('هل أنت متأكد من تحصيل كل هذه البوالص؟')">
-                        <i class="fas fa-check-double"></i> تحصيل جماعي
+                    <button type="submit" class="btn btn-primary fw-bold w-100 py-3">
+                        <i class="fas fa-search"></i> {{ 'مراجعة تاني' if preview else 'مراجعة قبل التحصيل' }}
                     </button>
                 </form>
             </div>

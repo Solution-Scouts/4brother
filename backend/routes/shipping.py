@@ -142,6 +142,63 @@ def update_shipping(id):
     return redirect(request.referrer)
 
 
+def _shipping_fee(company, amount):
+    """مصاريف شركة الشحن على مبلغ التحصيل (نفس الحساب المستخدم في التحصيل الجماعي)."""
+    fee = 0.0
+    if company and amount > 0:
+        fee += company.fee_first_1k
+        if amount > 1000:
+            fee += math.ceil((amount - 1000) / 1000) * company.fee_extra_1k
+    return fee
+
+
+def _bulk_collect_preview(waybill_numbers, account, accounts, waybill_input):
+    """شاشة التأكيد: بتقرا بس، ومش بتغيّر أي حاجة في الداتا بيز."""
+    from sqlalchemy.orm import selectinload
+    found = SaleOrder.query.options(selectinload(SaleOrder.customer))\
+        .filter(SaleOrder.waybill_no.in_(waybill_numbers)).all()
+    by_wb = {}
+    for o in found:
+        by_wb.setdefault(o.waybill_no, o)
+    companies = {c.id: c for c in ShippingCompany.query.all()}
+
+    rows, seen = [], set()
+    total_amount = total_fee = total_net = 0.0
+    for wb in waybill_numbers:
+        row = {'waybill': wb, 'ok': False, 'customer': '', 'order_id': None}
+        o = by_wb.get(wb)
+        if o:
+            row['customer'] = o.customer.name if o.customer else 'عميل نقدي'
+            row['order_id'] = o.id
+        if wb in seen:
+            row['error'] = 'مكررة في القائمة'
+        elif not o:
+            row['error'] = 'غير موجودة'
+        elif o.shipping_status == 'settled':
+            row['error'] = 'محصلة مسبقاً'
+        elif o.shipping_status not in ['shipped', 'delivered']:
+            row['error'] = f'حالة غير صالحة ({o.shipping_status})'
+        else:
+            amount = o.amount_due or 0
+            fee = _shipping_fee(companies.get(o.shipping_company_id), amount)
+            row.update(ok=True, amount=amount, fee=fee, net=amount - fee,
+                       status='تم التوصيل' if o.shipping_status == 'delivered' else 'تم الشحن')
+            total_amount += amount
+            total_fee += fee
+            total_net += amount - fee
+        seen.add(wb)
+        rows.append(row)
+
+    preview = {
+        'rows': rows,
+        'ok_count': sum(1 for r in rows if r['ok']),
+        'error_count': sum(1 for r in rows if not r['ok']),
+        'total_amount': round(total_amount, 2), 'total_fee': round(total_fee, 2), 'total_net': round(total_net, 2),
+        'account': account, 'waybills_text': waybill_input,
+    }
+    return render_template('bulk_collect.html', accounts=accounts, preview=preview)
+
+
 @app.route('/shipping/bulk_collect', methods=['GET', 'POST'])
 @login_required
 def bulk_collect():
@@ -167,6 +224,10 @@ def bulk_collect():
             flash('يجب إدخال رقم بوليصة واحد على الأقل!', 'danger')
             return redirect(request.referrer)
 
+        # الخطوة الأولى: شاشة تأكيد بتعرض كل بوليصة (العميل والمبلغ والمصاريف والصافي) من غير ما يتغيّر أي حاجة
+        if request.form.get('step') != 'confirm':
+            return _bulk_collect_preview(waybill_numbers, account, accounts, waybill_input)
+
         settled_count = 0
         total_net = 0
         errors = []
@@ -186,13 +247,7 @@ def bulk_collect():
             # حساب المصاريف
             company = ShippingCompany.query.get(order.shipping_company_id)
             amount_collected = order.amount_due
-            calculated_fee = 0.0
-            if company and amount_collected > 0:
-                calculated_fee += company.fee_first_1k
-                if amount_collected > 1000:
-                    extra_amount = amount_collected - 1000
-                    thousands_count = math.ceil(extra_amount / 1000)
-                    calculated_fee += thousands_count * company.fee_extra_1k
+            calculated_fee = _shipping_fee(company, amount_collected)
 
             net_income = amount_collected - calculated_fee
 
@@ -226,6 +281,69 @@ def bulk_collect():
         return redirect(url_for('bulk_collect'))
 
     return render_template('bulk_collect.html', accounts=accounts)
+
+
+def _is_ahmed():
+    return current_user.fullname == "أحمد عبد الفتاح" or current_user.username == "gm_ahmed"
+
+
+@app.route('/shipping/undo_collect/<int:order_id>', methods=['POST'])
+@login_required
+def undo_collect(order_id):
+    """إلغاء تحصيل شحنة اتحصّلت بالغلط (لأحمد عبد الفتاح بس):
+    - حركة عكسية في الخزينة بنفس صافي التحصيل (الحركة القديمة بتفضل في السجل).
+    - الفاتورة بترجع زي ما كانت قبل التحصيل: المطلوب تحصيله والحالة (تم الشحن / تم التوصيل)."""
+    back = request.referrer or url_for('shipping_daily_report')
+    if not _is_ahmed():
+        flash('إلغاء التحصيل لأحمد عبد الفتاح بس 🚫', 'danger')
+        return redirect(back)
+
+    restore_status = request.form.get('restore_status')
+    if restore_status not in ('shipped', 'delivered'):
+        flash('اختار الحالة اللي الشحنة ترجعلها (تم الشحن / تم التوصيل)', 'warning')
+        return redirect(back)
+
+    order = db.session.get(SaleOrder, order_id)
+    if not order or order.shipping_status != 'settled' or not order.shipping_settled_date or not order.is_shipping:
+        flash('الفاتورة دي مش شحنة محصّلة، مفيش حاجة تتلغي.', 'warning')
+        return redirect(back)
+
+    # حركات التحصيل والإلغاء السابقة للفاتورة دي (SQL مباشر علشان متتأثرش بفلتر الموسم)
+    tag = f"فاتورة #{order.id} بوليصة"
+    rows = db.session.execute(text(
+        "SELECT id, amount, account_id, category FROM financial_transaction "
+        "WHERE category IN ('تحصيل شحن', 'إلغاء تحصيل شحن') AND description LIKE :p ORDER BY id"
+    ), {'p': f"%{tag}%"}).fetchall()
+    collected = sum(float(r.amount) for r in rows if r.category == 'تحصيل شحن')
+    already_reversed = -sum(float(r.amount) for r in rows if r.category == 'إلغاء تحصيل شحن')
+    net_to_reverse = round(collected - already_reversed, 2)
+    last_income = next((r for r in reversed(rows) if r.category == 'تحصيل شحن'), None)
+    if net_to_reverse <= 0 or not last_income:
+        flash('مش لاقي حركة تحصيل للفاتورة دي في الخزينة، فمش هقدر ألغيها أوتوماتيك.', 'danger')
+        return redirect(back)
+
+    account = db.session.get(MoneyAccount, last_income.account_id)
+    if not account:
+        flash('الخزينة اللي اتحصّل فيها مش موجودة.', 'danger')
+        return redirect(back)
+
+    fee = order.shipping_fee or 0.0
+    account.balance = round(account.balance - net_to_reverse, 1)
+    db.session.add(FinancialTransaction(
+        account_id=account.id, type='expense', category='إلغاء تحصيل شحن', amount=-net_to_reverse,
+        description=f"إلغاء تحصيل خاطئ - {tag} {order.waybill_no} (العميل: {order.customer.name if order.customer else '-'})",
+        created_by_id=current_user.id, date=cairo_now()
+    ))
+    order.amount_due = round(net_to_reverse + fee, 2)
+    order.shipping_fee = 0.0
+    order.shipping_settled_date = None
+    order.shipping_status = restore_status
+    db.session.commit()
+
+    status_ar = "تم التوصيل" if restore_status == "delivered" else "تم الشحن"
+    flash(f'✅ اتلغى تحصيل البوليصة {order.waybill_no}: اتخصم {net_to_reverse} ج.م من {account.name}، '
+          f'والفاتورة #{order.id} رجعت "{status_ar}" ومطلوب تحصيلها {order.amount_due} ج.م', 'success')
+    return redirect(back)
 
 
 @app.route('/shipping/companies', methods=['GET', 'POST'])
@@ -323,6 +441,8 @@ def shipping_daily_report():
         settled_str = o.shipping_settled_date.strftime('%Y-%m-%d') if o.shipping_settled_date else o.date.strftime('%Y-%m-%d')
         
         report_data.append({
+            'id': o.id,
+            'can_undo': bool(o.is_shipping and o.shipping_settled_date),
             'invoice_date': o.date.strftime('%Y-%m-%d'), # تاريخ الفاتورة الأساسي
             'date': settled_str,                         # تاريخ التحصيل (للعرض في الجدول)
             'waybill': o.waybill_no,
@@ -337,6 +457,7 @@ def shipping_daily_report():
         totals['total_net'] += net_income
 
     return render_template('shipping_daily_report.html',
+                           can_undo_collect=_is_ahmed(),
                            orders=report_data,
                            totals=totals,
                            start_date=start_date,
